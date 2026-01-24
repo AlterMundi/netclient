@@ -135,10 +135,22 @@ func SetEgressRoutes(egressRoutes []models.EgressNetworkRoutes) {
 			if egressRangeIPNet.IP != nil {
 				if len(config.GetNodes()) == 1 {
 					if runtime.GOOS == "linux" {
-						addrs = append(addrs, ifaceAddress{
-							Network: egressRangeIPNet,
-							Metric:  egressRange.RouteMetric,
-						})
+						// 44MESH: Single-node Linux needs IP and GwIP for policy routing
+						if egressRangeIPNet.IP.To4() != nil && egressRoute.NodeAddr.IP != nil {
+							addrs = append(addrs, ifaceAddress{
+								GwIP:    egressRoute.EgressGwAddr.IP,
+								IP:      egressRoute.NodeAddr.IP,
+								Network: egressRangeIPNet,
+								Metric:  egressRange.RouteMetric,
+							})
+						} else if egressRangeIPNet.IP.To4() == nil && egressRoute.NodeAddr6.IP != nil {
+							addrs = append(addrs, ifaceAddress{
+								GwIP:    egressRoute.EgressGwAddr6.IP,
+								IP:      egressRoute.NodeAddr6.IP,
+								Network: egressRangeIPNet,
+								Metric:  egressRange.RouteMetric,
+							})
+						}
 					} else {
 						if egressRoute.EgressGwAddr.IP != nil {
 							addrs = append(addrs, ifaceAddress{
