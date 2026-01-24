@@ -20,6 +20,9 @@ import (
 const (
 	RouteTableName    = 111
 	EgressRouteMetric = 256
+	// 44MESH: Policy routing for public VPN IPs
+	PolicyRouteTable    = 112
+	PolicyRoutePriority = 100
 )
 
 // NCIface.Create - creates a linux WG interface based on a node's host config
@@ -150,6 +153,86 @@ func (nc *NCIface) ApplyAddrs() error {
 	return nil
 }
 
+// 44MESH: SetupPolicyRouting sets up source-based policy routing for VPN public IPs.
+// Traffic FROM the VPN IP routes through the tunnel, other traffic uses default gateway.
+func SetupPolicyRouting(vpnIP net.IP, gwIP net.IP) error {
+	if vpnIP == nil || gwIP == nil {
+		return nil
+	}
+
+	slog.Info("44mesh: setting up policy routing", "vpnIP", vpnIP.String(), "gateway", gwIP.String())
+
+	l, err := netlink.LinkByName(ncutils.GetInterfaceName())
+	if err != nil {
+		return fmt.Errorf("failed to get netmaker interface: %w", err)
+	}
+
+	// Add default route to policy table via VPN gateway
+	policyRoute := netlink.Route{
+		LinkIndex: l.Attrs().Index,
+		Dst:       nil, // default route (0.0.0.0/0)
+		Gw:        gwIP,
+		Table:     PolicyRouteTable,
+		Priority:  1,
+	}
+
+	if err := netlink.RouteReplace(&policyRoute); err != nil {
+		slog.Warn("failed to add policy route", "error", err.Error())
+	}
+
+	// Build source CIDR for the rule
+	var mask net.IPMask
+	if vpnIP.To4() != nil {
+		mask = net.CIDRMask(32, 32)
+	} else {
+		mask = net.CIDRMask(128, 128)
+	}
+
+	// Add ip rule: from <vpnIP> lookup table PolicyRouteTable
+	rule := netlink.NewRule()
+	rule.Src = &net.IPNet{IP: vpnIP, Mask: mask}
+	rule.Table = PolicyRouteTable
+	rule.Priority = PolicyRoutePriority
+
+	// Delete existing rule first (ignore errors)
+	_ = netlink.RuleDel(rule)
+
+	if err := netlink.RuleAdd(rule); err != nil {
+		return fmt.Errorf("failed to add policy rule: %w", err)
+	}
+
+	slog.Info("44mesh: policy routing configured",
+		"rule", fmt.Sprintf("from %s lookup table %d", vpnIP.String(), PolicyRouteTable))
+	return nil
+}
+
+// 44MESH: RemovePolicyRouting removes source-based policy routing for a VPN IP.
+func RemovePolicyRouting(vpnIP net.IP) error {
+	if vpnIP == nil {
+		return nil
+	}
+
+	slog.Info("44mesh: removing policy routing", "vpnIP", vpnIP.String())
+
+	var mask net.IPMask
+	if vpnIP.To4() != nil {
+		mask = net.CIDRMask(32, 32)
+	} else {
+		mask = net.CIDRMask(128, 128)
+	}
+
+	rule := netlink.NewRule()
+	rule.Src = &net.IPNet{IP: vpnIP, Mask: mask}
+	rule.Table = PolicyRouteTable
+	rule.Priority = PolicyRoutePriority
+
+	if err := netlink.RuleDel(rule); err != nil {
+		slog.Warn("failed to remove policy rule", "error", err.Error())
+	}
+
+	return nil
+}
+
 // RemoveRoutes - Remove routes to the interface
 func RemoveRoutes(addrs []ifaceAddress) {
 	l, err := netlink.LinkByName(ncutils.GetInterfaceName())
@@ -159,11 +242,20 @@ func RemoveRoutes(addrs []ifaceAddress) {
 	}
 
 	for _, addr := range addrs {
-		if (len(config.GetNodes()) > 1 && addr.IP == nil) || addr.Network.IP == nil || addr.Network.String() == IPv4Network ||
-			addr.Network.String() == IPv6Network || (len(config.GetNodes()) > 1 && addr.GwIP == nil) {
+		if addr.Network.IP == nil {
 			continue
 		}
-		slog.Info("removing route to interface", "route", fmt.Sprintf("%s -> %s ->%s", addr.IP.String(), addr.Network.String(), addr.GwIP.String()))
+		// 44MESH: Use policy routing removal for 0.0.0.0/0
+		if addr.Network.String() == IPv4Network || addr.Network.String() == IPv6Network {
+			if addr.IP != nil {
+				RemovePolicyRouting(addr.IP)
+			}
+			continue
+		}
+		if (len(config.GetNodes()) > 1 && addr.IP == nil) || (len(config.GetNodes()) > 1 && addr.GwIP == nil) {
+			continue
+		}
+		slog.Info("removing route to interface", "route", fmt.Sprintf("%s -> %s -> %s", addr.IP.String(), addr.Network.String(), addr.GwIP.String()))
 		if err := netlink.RouteDel(&netlink.Route{
 			LinkIndex: l.Attrs().Index,
 			Gw:        addr.GwIP,
@@ -185,11 +277,20 @@ func SetRoutes(addrs []ifaceAddress) error {
 	}
 
 	for _, addr := range addrs {
-		if (len(config.GetNodes()) > 1 && addr.IP == nil) || addr.Network.IP == nil || addr.Network.String() == IPv4Network ||
-			addr.Network.String() == IPv6Network || (len(config.GetNodes()) > 1 && addr.GwIP == nil) {
+		if addr.Network.IP == nil || (len(config.GetNodes()) > 1 && addr.GwIP == nil) {
 			continue
 		}
-		slog.Info("adding route to interface", "route", fmt.Sprintf("%s -> %s ->%s", addr.IP.String(), addr.Network.String(), addr.GwIP.String()))
+		// 44MESH: Use policy routing for 0.0.0.0/0 instead of main table
+		if addr.Network.String() == IPv4Network || addr.Network.String() == IPv6Network {
+			if addr.IP != nil && addr.GwIP != nil {
+				SetupPolicyRouting(addr.IP, addr.GwIP)
+			}
+			continue // Don't add to main routing table
+		}
+		if len(config.GetNodes()) > 1 && addr.IP == nil {
+			continue
+		}
+		slog.Info("adding route to interface", "route", fmt.Sprintf("%s -> %s -> %s", addr.IP.String(), addr.Network.String(), addr.GwIP.String()))
 		metric := EgressRouteMetric
 		if addr.Metric > 0 && addr.Metric < 999 {
 			metric = int(addr.Metric)
