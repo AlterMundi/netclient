@@ -864,6 +864,11 @@ func (n *nftablesManager) DeleteRoutingRule(server, ruletableName, srcPeerKey, d
 	return nil
 }
 
+// ApplyLocalACLRules - nftables implementation is not yet available
+func (n *nftablesManager) ApplyLocalACLRules(cfg *LocalACLConfig) {
+	slog.Warn("44mesh: local ACL rules not yet implemented for nftables backend")
+}
+
 // nftables.FlushAll - removes all the rules added by netmaker and deletes the netmaker chains
 func (n *nftablesManager) FlushAll() {
 	n.mux.Lock()

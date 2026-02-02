@@ -81,6 +81,8 @@ type firewallController interface {
 	DeleteRuleTable(server, ruleTableName string)
 	// SaveRules - saves the ruleTable under the given server
 	SaveRules(server, ruleTableName string, ruleTable ruletable)
+	// ApplyLocalACLRules - applies local ACL rules overriding the blanket ACCEPT
+	ApplyLocalACLRules(cfg *LocalACLConfig)
 	// FlushAll - clears all rules from netmaker chains and deletes the chains
 	FlushAll()
 }

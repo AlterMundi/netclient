@@ -3,6 +3,8 @@ package firewall
 import (
 	"reflect"
 
+	"golang.org/x/exp/slog"
+
 	"github.com/gravitl/netmaker/models"
 )
 
@@ -12,7 +14,11 @@ func ProcessAclRules(server string, fwUpdate *models.FwUpdate) {
 	if fwCrtl == nil {
 		return
 	}
-	if fwUpdate.AllowAll {
+	localACL := LoadLocalACLConfig()
+	if fwUpdate.AllowAll && localACL != nil && localACL.Enabled && len(localACL.Rules) > 0 {
+		slog.Info("44mesh: local ACL rules override server AllowAll")
+		fwCrtl.ApplyLocalACLRules(localACL)
+	} else if fwUpdate.AllowAll {
 		fwCrtl.ChangeACLInTarget(targetAccept)
 		fwCrtl.ChangeACLFwdTarget(targetAccept)
 	} else {

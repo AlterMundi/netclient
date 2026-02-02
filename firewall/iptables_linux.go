@@ -221,6 +221,112 @@ func (i *iptablesManager) ChangeACLFwdTarget(target string) {
 	}
 }
 
+// ApplyLocalACLRules replaces the blanket ACCEPT with specific per-source/port
+// rules followed by DROP, based on the local ACL config file.
+func (i *iptablesManager) ApplyLocalACLRules(cfg *LocalACLConfig) {
+	i.removeLocalACLRules(i.ipv4Client)
+	i.removeLocalACLRules(i.ipv6Client)
+
+	// Ensure the default target is DROP (not ACCEPT) in both chains
+	i.ChangeACLInTarget(targetDrop)
+	i.ChangeACLFwdTarget(targetDrop)
+
+	ifaceName := ncutils.GetInterfaceName()
+
+	// Insert LOG rule just before the DROP if requested
+	if cfg.LogDropped {
+		prefix := cfg.LogPrefix
+		if prefix == "" {
+			prefix = "NETMAKER-ACL-DROP: "
+		}
+		for _, chain := range []string{aclInputRulesChain, aclFwdRulesChain} {
+			logRule := []string{
+				"-i", ifaceName,
+				"-m", "comment", "--comment", localACLComment,
+				"-j", "LOG", "--log-prefix", prefix,
+			}
+			i.insertLocalACLBeforeDrop(i.ipv4Client, chain, logRule)
+			i.insertLocalACLBeforeDrop(i.ipv6Client, chain, logRule)
+		}
+	}
+
+	// Insert ACCEPT rules for each local ACL rule, before the DROP/LOG
+	for j := len(cfg.Rules) - 1; j >= 0; j-- {
+		rule := cfg.Rules[j]
+		isV4 := isAddrIpv4(rule.Source)
+		var client *iptables.IPTables
+		if isV4 {
+			client = i.ipv4Client
+		} else {
+			client = i.ipv6Client
+		}
+
+		for _, chain := range []string{aclInputRulesChain, aclFwdRulesChain} {
+			ruleSpec := i.buildLocalACLRule(ifaceName, rule)
+			i.insertLocalACLBeforeDrop(client, chain, ruleSpec)
+		}
+	}
+
+	slog.Info("44mesh: applied local ACL rules",
+		"rules", len(cfg.Rules),
+		"log_dropped", cfg.LogDropped,
+	)
+}
+
+// removeLocalACLRules removes all iptables rules tagged with the NETMAKER-LOCAL-ACL comment
+func (i *iptablesManager) removeLocalACLRules(client *iptables.IPTables) {
+	for _, chain := range []string{aclInputRulesChain, aclFwdRulesChain} {
+		rules, err := client.List(defaultIpTable, chain)
+		if err != nil {
+			continue
+		}
+		for _, rule := range rules {
+			if containsComment(rule, localACLComment) {
+				fields := strings.Fields(rule)
+				if len(fields) > 2 {
+					fields = fields[2:]
+				}
+				client.Delete(defaultIpTable, chain, fields...)
+			}
+		}
+	}
+}
+
+// buildLocalACLRule constructs an iptables rule spec from a LocalACLRule
+func (i *iptablesManager) buildLocalACLRule(ifaceName string, rule LocalACLRule) []string {
+	ruleSpec := []string{"-i", ifaceName, "-s", rule.Source}
+	if rule.Protocol != "" {
+		ruleSpec = append(ruleSpec, "-p", rule.Protocol)
+	}
+	if rule.Port != "" {
+		if strings.Contains(rule.Port, "-") {
+			rule.Port = strings.ReplaceAll(rule.Port, "-", ":")
+		}
+		ruleSpec = append(ruleSpec, "--dport", rule.Port)
+	}
+	ruleSpec = append(ruleSpec, "-m", "comment", "--comment", localACLComment)
+	ruleSpec = append(ruleSpec, "-j", "ACCEPT")
+	return ruleSpec
+}
+
+// insertLocalACLBeforeDrop inserts a rule just before the last rule (DROP) in the chain
+func (i *iptablesManager) insertLocalACLBeforeDrop(client *iptables.IPTables, chain string, ruleSpec []string) {
+	rules, err := client.List(defaultIpTable, chain)
+	if err != nil {
+		slog.Warn("failed to list rules for local ACL insert", "chain", chain, "error", err)
+		return
+	}
+	// Position = number of rules (len-1 for header) to insert before the last one
+	pos := len(rules) - 1 // last rule index (1-based), which is the DROP
+	if pos < 1 {
+		pos = 1
+	}
+	err = client.Insert(defaultIpTable, chain, pos, ruleSpec...)
+	if err != nil {
+		slog.Warn("failed to insert local ACL rule", "chain", chain, "rule", ruleSpec, "error", err)
+	}
+}
+
 // iptablesManager.ForwardRule inserts forwarding rules
 func (i *iptablesManager) ForwardRule() error {
 	i.mux.Lock()

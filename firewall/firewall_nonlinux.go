@@ -73,6 +73,7 @@ func (unimplementedFirewall) DeleteAclEgressRule(server, nodeID, aclID string)  
 func (unimplementedFirewall) UpsertAclEgressRule(server, nodeID string, aclRule models.AclRule) {}
 func (unimplementedFirewall) DeleteAllAclEgressRules(server, egressID string)                   {}
 func (unimplementedFirewall) AddDropRules([]ruleInfo)                                           {}
+func (unimplementedFirewall) ApplyLocalACLRules(cfg *LocalACLConfig)                            {}
 
 // newFirewall returns an unimplemented Firewall manager
 func newFirewall() (firewallController, error) {
