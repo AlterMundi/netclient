@@ -6,6 +6,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gravitl/netclient/config"
@@ -17,14 +18,76 @@ import (
 
 const (
 	ttlTimeout = 3600
+
+	// Maximum concurrent upstream DNS queries to prevent goroutine explosion.
+	maxConcurrentQueries = 64
+
+	// Circuit breaker: after this many consecutive failures for a server,
+	// skip it for backoffDuration before retrying.
+	circuitBreakerThreshold = 5
+	circuitBreakerBackoff   = 10 * time.Second
 )
 
 var dnsMapMutex sync.RWMutex // used to mutex functions of the DNS
 
+// querySemaphore limits concurrent upstream DNS exchanges.
+var querySemaphore = make(chan struct{}, maxConcurrentQueries)
+
+// circuitBreaker tracks consecutive failures per upstream server.
+type circuitBreaker struct {
+	mu       sync.Mutex
+	failures map[string]int
+	backoff  map[string]time.Time
+}
+
+var breaker = &circuitBreaker{
+	failures: make(map[string]int),
+	backoff:  make(map[string]time.Time),
+}
+
+// isOpen returns true if the server is in backoff (circuit is open).
+func (cb *circuitBreaker) isOpen(server string) bool {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	until, ok := cb.backoff[server]
+	if !ok {
+		return false
+	}
+	if time.Now().After(until) {
+		// Backoff expired, allow a probe.
+		delete(cb.backoff, server)
+		cb.failures[server] = circuitBreakerThreshold - 1 // one more failure re-opens
+		return false
+	}
+	return true
+}
+
+// recordFailure increments consecutive failures; opens circuit if threshold hit.
+func (cb *circuitBreaker) recordFailure(server string) {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	cb.failures[server]++
+	if cb.failures[server] >= circuitBreakerThreshold {
+		cb.backoff[server] = time.Now().Add(circuitBreakerBackoff)
+		slog.Warn("DNS circuit breaker opened", "server", server, "backoff", circuitBreakerBackoff)
+	}
+}
+
+// recordSuccess resets failure count for a server.
+func (cb *circuitBreaker) recordSuccess(server string) {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	delete(cb.failures, server)
+	delete(cb.backoff, server)
+}
+
+// droppedQueries counts queries dropped due to concurrency limit (observable metric).
+var droppedQueries atomic.Int64
+
 var (
 	ErrNXDomain      = errors.New("non existent domain")
 	ErrNoQTypeRecord = errors.New("domain exists but no record matching the question type")
-	dnsUDPConnPool   = newUDPConnPool()
+	dnsUDPConnPool   = newBoundedConnPool()
 )
 
 type DNSResolver struct {
@@ -54,18 +117,22 @@ func handleDNSRequest(w dns.ResponseWriter, r *dns.Msg) {
 	reply.RecursionDesired = true
 	reply.Rcode = dns.RcodeSuccess
 	logger.Log(4, fmt.Sprintf("resolving dns query %s", r.Question[0].Name))
-	if config.Netclient().CurrGwNmIP != nil {
+
+	// Snapshot config once per request to avoid repeated RLock acquisition.
+	nc := config.Netclient()
+
+	if nc.CurrGwNmIP != nil {
+		gwIP := nc.CurrGwNmIP.String()
 		logger.Log(4, fmt.Sprintf(
 			"connected to gw, forwarding dns query %s to gw %s",
-			r.Question[0].Name,
-			config.Netclient().CurrGwNmIP.String()),
+			r.Question[0].Name, gwIP),
 		)
 
-		resp, err := exchangeDNSQueryWithPool(r, config.Netclient().CurrGwNmIP.String())
+		resp, err := exchangeDNSQueryWithPool(r, gwIP)
 		if err != nil {
-			logger.Log(4, fmt.Sprintf("failed to resolve dns query %s with gw %s: %v", r.Question[0].Name, config.Netclient().CurrGwNmIP.String(), err))
+			logger.Log(4, fmt.Sprintf("failed to resolve dns query %s with gw %s: %v", r.Question[0].Name, gwIP, err))
 		} else {
-			logger.Log(4, fmt.Sprintf("resolved dns query %s with gw %s: %v", r.Question[0].Name, config.Netclient().CurrGwNmIP.String(), resp.Answer))
+			logger.Log(4, fmt.Sprintf("resolved dns query %s with gw %s: %v", r.Question[0].Name, gwIP, resp.Answer))
 			reply.Authoritative = resp.Authoritative
 			reply.Answer = append(reply.Answer, resp.Answer...)
 		}
@@ -234,11 +301,25 @@ func exchangeDNSQueryWithPool(r *dns.Msg, ns string) (*dns.Msg, error) {
 	}
 	serverAddr := ns + ":53"
 
+	// Circuit breaker: skip servers in backoff.
+	if breaker.isOpen(serverAddr) {
+		return nil, fmt.Errorf("circuit breaker open for %s", serverAddr)
+	}
+
+	// Concurrency limiter: drop query if too many in-flight.
+	select {
+	case querySemaphore <- struct{}{}:
+		defer func() { <-querySemaphore }()
+	default:
+		droppedQueries.Add(1)
+		return nil, fmt.Errorf("DNS concurrency limit reached (%d), dropping query", maxConcurrentQueries)
+	}
+
 	conn, err := dnsUDPConnPool.get(serverAddr)
 	if err != nil {
+		breaker.recordFailure(serverAddr)
 		return nil, err
 	}
-	defer dnsUDPConnPool.put(serverAddr, conn)
 
 	dnsConn := &dns.Conn{
 		Conn:    conn,
@@ -247,7 +328,17 @@ func exchangeDNSQueryWithPool(r *dns.Msg, ns string) (*dns.Msg, error) {
 
 	client := &dns.Client{Net: "udp", Timeout: time.Second * 3}
 	resp, _, err := client.ExchangeWithConn(r, dnsConn)
-	return resp, err
+	if err != nil {
+		// Connection is likely broken — discard instead of returning to pool.
+		dnsUDPConnPool.discard(conn)
+		breaker.recordFailure(serverAddr)
+		return nil, err
+	}
+
+	// Success — return connection to pool and reset circuit breaker.
+	dnsUDPConnPool.put(serverAddr, conn)
+	breaker.recordSuccess(serverAddr)
+	return resp, nil
 }
 
 func findBestMatch(domain string, nameservers []models.Nameserver) []models.Nameserver {
